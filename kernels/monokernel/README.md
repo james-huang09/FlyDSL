@@ -54,6 +54,11 @@ are rebuilt for each copy. Scratch, peer buffers, epochs, and the compiled
 launcher are shared, as for consecutive layers. Allocation and packing are
 outside the measured region.
 
+Weight sets are named `w_layer_0` through `w_layer_7` in the test code and
+functional logs. `w_layer_0` uses the original tensors; the other sets hold
+copies. Tensor names remain meaningful within each set, for example
+`w_layer_1.w_ug` and `w_layer_1.s_ug`.
+
 For every functional iteration, all copies run the same input through the
 same stage checks, KV checks, and independent golden. The existing 5%
 relative-L2 limit and routing-mismatch skip rule remain unchanged. Copies
@@ -68,3 +73,11 @@ length, and iteration count; TP results also report the maximum rank latency.
 These are synthetic identical-weight layers at different addresses, not
 independently trained layers or eight independent requests. Benchmarking
 alone does not run the functional acceptance checks.
+
+Eight weight sets do not mean eight graph replays. A functional iteration
+(`--iters 1`) calls each weight set once, for eight layer launches without a
+HIP graph. A default benchmark graph has 16 layer launches, using
+`w_layer_0` through `w_layer_7` twice. `--bench-iters 320` times 20 graph
+replays; `--bench-iters 4096` times 256. These counts exclude warmup. The
+benchmark prints the weight-set names, layers per graph, timed replays, and
+timed layer launches before timing.

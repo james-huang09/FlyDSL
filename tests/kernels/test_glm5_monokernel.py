@@ -85,26 +85,29 @@ def _check(name, got, ref, report):
     return not bool(bad.any())
 
 
-def _weight_copies(op, count):
-    """Same values at distinct addresses, sharing the native scratch/epochs/IPC.
+def _weight_layers(op, count):
+    """Named weight sets at distinct addresses, sharing the native scratch/epochs/IPC.
 
-    Copy final launch tensors after packing. Only ``op`` owns the peer buffer;
-    the borrowed views must not be closed independently. Indexer pointer tables
-    also need rebuilding, otherwise those weights would keep their old addresses.
+    ``w_layer_0`` uses the original weights; ``w_layer_1`` through ``w_layer_7``
+    hold copies of the final packed tensors. Each set retains tensor names such
+    as ``w_ug`` and ``s_ug``, so a copy is identified as ``w_layer_1.w_ug``.
+    Only ``op`` owns the peer buffer; borrowed layer ops must not be closed
+    independently. Rebuild indexer pointer tables to use each set's addresses.
     """
     if count not in (1, 8):
         raise ValueError("weight_copies must be 1 or 8")
-    tensors = dict(op.W.t, **op.packed)
-    views = [op]
-    for _ in range(1, count):
-        view = copy.copy(op)
-        view.W = copy.copy(op.W)
-        view.W.t = {name: value.clone() for name, value in tensors.items()}
-        view.packed = {}
+    base_weights = dict(op.W.t, **op.packed)
+    layer_ops = {"w_layer_0": op}
+    for layer_id in range(1, count):
+        layer_name = f"w_layer_{layer_id}"
+        layer_op = copy.copy(op)
+        layer_op.W = copy.copy(op.W)
+        layer_op.W.t = {tensor_name: tensor.clone() for tensor_name, tensor in base_weights.items()}
+        layer_op.packed = {}
         if op.with_indexer:
-            view.index_params = torch.tensor(
+            layer_op.index_params = torch.tensor(
                 [
-                    view.W.t[name].data_ptr()
+                    layer_op.W.t[name].data_ptr()
                     for name in (
                         "w_index_k",
                         "s_index_k",
@@ -119,11 +122,14 @@ def _weight_copies(op, count):
                 dtype=torch.int64,
                 device=op.step.device,
             )
-        views.append(view)
-    for name in tensors:
-        pointers = {dict(view.W.t, **view.packed)[name].data_ptr() for view in views}
-        assert len(pointers) == count, f"weight copies alias: {name}"
-    return views
+        layer_ops[layer_name] = layer_op
+    for tensor_name in base_weights:
+        pointers = {
+            layer_name: dict(layer_op.W.t, **layer_op.packed)[tensor_name].data_ptr()
+            for layer_name, layer_op in layer_ops.items()
+        }
+        assert len(set(pointers.values())) == count, f"weight layers alias for {tensor_name}: {pointers}"
+    return layer_ops
 
 
 def run_rank(
@@ -171,7 +177,7 @@ def run_rank(
         with_indexer=with_indexer,
         index_max_seq=MAX_SEQ,
     )
-    ops = _weight_copies(op, weight_copies)
+    layer_ops = _weight_layers(op, weight_copies)
 
     if npes == 1:
         allreduce = lambda x: x  # noqa: E731
@@ -188,13 +194,13 @@ def run_rank(
     ok = True
     for it in range(iters):
         h = (torch.randn(S, 6144, generator=gen, device=dev)).to(torch.bfloat16)
-        for bank_id, bank in enumerate(ops):
+        for layer_name, layer_op in layer_ops.items():
             kv, pe = kv0.clone(), pe0.clone()
             index_cache = index0.clone() if with_indexer else None
             pos_t = torch.tensor([cur_pos], dtype=torch.int32, device=dev)
-            out = bank.forward(h, pos_t, kv, pe, indices, cos, sin, index_cache=index_cache)
+            out = layer_op.forward(h, pos_t, kv, pe, indices, cos, sin, index_cache=index_cache)
             torch.cuda.synchronize()
-            got = bank.intermediates()
+            got = layer_op.intermediates()
             got["x_out"] = out
             kv_ref, pe_ref = kv0.clone(), pe0.clone()
             report = []
@@ -253,18 +259,16 @@ def run_rank(
             rows = slice(cur_pos, cur_pos + S)
             ok &= _check("kv", kv[rows], kv_ref[rows], report)
             if rank == 0 or not ok:
-                lines = [
-                    f"[rank {rank} iter {it} weight_copy {bank_id}] ok={ok} sel_ok={torch.equal(got['sel'], moe['sel'])}"
-                ]
+                lines = [f"[rank {rank} iter {it} {layer_name}] ok={ok} sel_ok={torch.equal(got['sel'], moe['sel'])}"]
                 lines += [f"   {n:9s} max_err={e:.3e} ref_max={m:.3e} {nb}" for n, e, m, nb in report]
                 print("\n".join(lines), flush=True)
-            if bank_id == 0:
+            if layer_name == "w_layer_0":
                 first_output = out.clone()
             else:
                 equal = torch.equal(out, first_output)
                 ok &= equal
                 if rank == 0 or not equal:
-                    print(f"[rank {rank} iter {it} weight_copy {bank_id}] bitwise_equal={equal}", flush=True)
+                    print(f"[rank {rank} iter {it} {layer_name}] bitwise_equal_to_w_layer_0={equal}", flush=True)
     op.close()
     return ok
 
@@ -312,12 +316,14 @@ def bench_rank(
         with_indexer=with_indexer,
         index_max_seq=MAX_SEQ,
     )
-    ops = _weight_copies(op, weight_copies)
+    layer_ops = _weight_layers(op, weight_copies)
+    weight_layer_names = tuple(layer_ops)
     h = torch.randn(S, 6144, generator=gen, device=dev).to(torch.bfloat16)
     x = torch.empty_like(h)
     pos_t = torch.tensor([cur_pos], dtype=torch.int32, device=dev)
     for warmup in range(max(10, weight_copies)):
-        ops[warmup % weight_copies].forward(h, pos_t, kv, pe, indices, cos, sin, x_out=x, index_cache=index_cache)
+        layer_name = weight_layer_names[warmup % weight_copies]
+        layer_ops[layer_name].forward(h, pos_t, kv, pe, indices, cos, sin, x_out=x, index_cache=index_cache)
     torch.cuda.synchronize()
     import torch.distributed as dist
 
@@ -344,7 +350,8 @@ def bench_rank(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for layer in range(launches_per_step):
-            ops[layer % weight_copies].forward(
+            layer_name = weight_layer_names[layer % weight_copies]
+            layer_ops[layer_name].forward(
                 h,
                 pos_t,
                 kv,
@@ -358,6 +365,13 @@ def bench_rank(
                 index_cache=index_cache,
             )
         op.advance_step()
+    timed_replays = iters // launches_per_step
+    if rank == 0:
+        print(
+            f"weight_layers={','.join(weight_layer_names)} graph_layers={launches_per_step} "
+            f"timed_replays={timed_replays} timed_layer_launches={timed_replays * launches_per_step}",
+            flush=True,
+        )
     # Short decode graphs otherwise spend a material fraction of the timed
     # window ramping clocks from the idle state.  Scale warmup with the run so
     # isolated and already-busy-machine measurements remain comparable.
@@ -368,11 +382,11 @@ def bench_rank(
         dist.barrier()
     t0, t1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     t0.record()
-    for _ in range(iters // launches_per_step):
+    for _ in range(timed_replays):
         graph.replay()
     t1.record()
     torch.cuda.synchronize()
-    elapsed = t0.elapsed_time(t1) * 1e3 / (iters // launches_per_step * launches_per_step)
+    elapsed = t0.elapsed_time(t1) * 1e3 / (timed_replays * launches_per_step)
     op.close()
     return elapsed
 
