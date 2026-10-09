@@ -10,15 +10,9 @@ Single GPU (TP1 view of one shard, the peer reduce is a 1-rank loopback)::
 TP8, one process per GPU::
 
     python3 tests/kernels/test_glm5_monokernel.py --npes 8
-
-MXFP4 with eight weight addresses (same checks and benchmark as one address)::
-
-    python3 tests/kernels/test_glm5_monokernel.py --npes 8 -S 4 --pos 3000 --mxfp4 --weight-copies 8
-    python3 tests/kernels/test_glm5_monokernel.py --npes 8 -S 4 --pos 3000 --mxfp4 --weight-copies 8 --bench
 """
 
 import argparse
-import copy
 import os
 import sys
 
@@ -85,65 +79,7 @@ def _check(name, got, ref, report):
     return not bool(bad.any())
 
 
-def _weight_layers(op, count):
-    """Named weight sets at distinct addresses, sharing the native scratch/epochs/IPC.
-
-    ``w_layer_0`` uses the original weights; ``w_layer_1`` through ``w_layer_7``
-    hold copies of the final packed tensors. Each set retains tensor names such
-    as ``w_ug`` and ``s_ug``, so a copy is identified as ``w_layer_1.w_ug``.
-    Only ``op`` owns the peer buffer; borrowed layer ops must not be closed
-    independently. Rebuild indexer pointer tables to use each set's addresses.
-    """
-    if count not in (1, 8):
-        raise ValueError("weight_copies must be 1 or 8")
-    base_weights = dict(op.W.t, **op.packed)
-    layer_ops = {"w_layer_0": op}
-    for layer_id in range(1, count):
-        layer_name = f"w_layer_{layer_id}"
-        layer_op = copy.copy(op)
-        layer_op.W = copy.copy(op.W)
-        layer_op.W.t = {tensor_name: tensor.clone() for tensor_name, tensor in base_weights.items()}
-        layer_op.packed = {}
-        if op.with_indexer:
-            layer_op.index_params = torch.tensor(
-                [
-                    layer_op.W.t[name].data_ptr()
-                    for name in (
-                        "w_index_k",
-                        "s_index_k",
-                        "w_index_w",
-                        "w_index_q",
-                        "s_index_q",
-                        "g_index_k",
-                        "b_index_k",
-                    )
-                ]
-                + [0 if op.timeline is None else op.timeline.data_ptr()],
-                dtype=torch.int64,
-                device=op.step.device,
-            )
-        layer_ops[layer_name] = layer_op
-    for tensor_name in base_weights:
-        pointers = {
-            layer_name: dict(layer_op.W.t, **layer_op.packed)[tensor_name].data_ptr()
-            for layer_name, layer_op in layer_ops.items()
-        }
-        assert len(set(pointers.values())) == count, f"weight layers alias for {tensor_name}: {pointers}"
-    return layer_ops
-
-
-def run_rank(
-    rank,
-    npes,
-    S,
-    cur_pos,
-    iters,
-    group=None,
-    seed=1234,
-    with_indexer=False,
-    expert_mxfp4=False,
-    weight_copies=1,
-):
+def run_rank(rank, npes, S, cur_pos, iters, group=None, seed=1234, with_indexer=False, expert_mxfp4=False):
     from kernels.monokernel.glm import Glm5MonoKernel
 
     dev = torch.device("cuda", rank)
@@ -177,7 +113,6 @@ def run_rank(
         with_indexer=with_indexer,
         index_max_seq=MAX_SEQ,
     )
-    layer_ops = _weight_layers(op, weight_copies)
 
     if npes == 1:
         allreduce = lambda x: x  # noqa: E731
@@ -185,8 +120,6 @@ def run_rank(
         import torch.distributed as dist
 
         def allreduce(x):
-            # The native peer protocol transmits BF16 partials, then sums in FP32.
-            x = x.to(torch.bfloat16).float()
             parts = [torch.empty_like(x.cpu()) for _ in range(npes)]
             dist.all_gather(parts, x.cpu().contiguous(), group=group)
             return sum(parts[1:], parts[0]).to(x.device)
@@ -194,97 +127,67 @@ def run_rank(
     ok = True
     for it in range(iters):
         h = (torch.randn(S, 6144, generator=gen, device=dev)).to(torch.bfloat16)
-        for layer_name, layer_op in layer_ops.items():
-            kv, pe = kv0.clone(), pe0.clone()
-            index_cache = index0.clone() if with_indexer else None
-            pos_t = torch.tensor([cur_pos], dtype=torch.int32, device=dev)
-            out = layer_op.forward(h, pos_t, kv, pe, indices, cos, sin, index_cache=index_cache)
-            torch.cuda.synchronize()
-            got = layer_op.intermediates()
-            got["x_out"] = out
-            kv_ref, pe_ref = kv0.clone(), pe0.clone()
-            report = []
-            ref_indices = indices
-            if with_indexer:
-                index_ref = index0.clone()
-                selected, index_q, index_w, _, _ = indexer_golden(
-                    W, h, got["q_a"], cur_pos, index_ref, cos, sin, topk=topk
-                )
-                got_index_q = got["index_q"].clone()
-                for s in range(S):
-                    pos = cur_pos + s
-                    got_index_q[s, :, :PE_DIM] = rope(got_index_q[s, :, :PE_DIM], cos[pos], sin[pos])
-                got_index_q = got_index_q.to(torch.bfloat16).float()
-                ok &= _check("index_q", got_index_q, index_q, report)
-                ok &= _check("index_w", got["index_w"], index_w, report)
-                rows = slice(cur_pos, cur_pos + S)
-                ok &= _check("index_k", index_cache[rows], index_ref[rows], report)
-                selected_ok = all(
-                    torch.equal(got["indices"][s].sort().values, selected[s].sort().values) for s in range(S)
-                )
-                ok &= selected_ok
-                report.append(("index_sel", 0.0, 0.0, f"set_equal={selected_ok}"))
-                # Preserve the kernel's ascending-token output order so split-attention
-                # rounding is compared independently of the selector's order.
-                ref_indices = got["indices"]
-            ref = golden_layer(W, h, cur_pos, kv_ref, pe_ref, ref_indices, cos, sin, allreduce, topk=topk)
-            # attention half vs the full golden
-            for name in ("q_a", "kv_a", "q_nope", "q_pe", "q_lat", "o", "a"):
-                ok &= _check(name, got[name], ref[name], report)
-            # MoE half vs the golden fed the kernel's own post-attention state, so a
-            # 1-ulp difference in ``a`` cannot flip FP8 roundings downstream
-            moe = golden_moe(W, got["a"].clone(), allreduce)
-            for name in ("scores", "prob", "xq"):
-                ok &= _check(name, got[name], moe[name], report)
-            # up/gate + SiLU from the kernel's own FP8 activation
-            ug = golden_moe(W, got["a"].clone(), allreduce, xq=got["xq"].clone())
-            ok &= _check("mid", got["mid"], ug["mid"], report)
-            # down + route weighting + TP reduce + residual from the kernel's own mid
-            down = golden_moe(
-                W,
-                got["a"].clone(),
-                allreduce,
-                got["mid"].clone(),
-                got["sel"].clone(),
-                got["prob"].clone(),
-            )
-            ok &= _check("x_out", got["x_out"], down["x_out"], report)
-            ok &= torch.equal(got["sel"], moe["sel"])
-            # fully independent golden: only comparable when a 1-ulp difference in ``a``
-            # did not flip a near-tied routing decision
-            if torch.equal(ref["sel"], moe["sel"]):
-                ok &= _check("x_out_e2e", got["x_out"], ref["x_out"], report)
-            else:
-                report.append(("x_out_e2e", 0.0, 0.0, "skipped: golden routing flipped on a 1-ulp difference in a"))
+        kv, pe = kv0.clone(), pe0.clone()
+        index_cache = index0.clone() if with_indexer else None
+        pos_t = torch.tensor([cur_pos], dtype=torch.int32, device=dev)
+        out = op.forward(h, pos_t, kv, pe, indices, cos, sin, index_cache=index_cache)
+        torch.cuda.synchronize()
+        got = op.intermediates()
+        got["x_out"] = out
+        kv_ref, pe_ref = kv0.clone(), pe0.clone()
+        report = []
+        ref_indices = indices
+        if with_indexer:
+            index_ref = index0.clone()
+            selected, index_q, index_w, _, _ = indexer_golden(W, h, got["q_a"], cur_pos, index_ref, cos, sin, topk=topk)
+            got_index_q = got["index_q"].clone()
+            for s in range(S):
+                pos = cur_pos + s
+                got_index_q[s, :, :PE_DIM] = rope(got_index_q[s, :, :PE_DIM], cos[pos], sin[pos])
+            got_index_q = got_index_q.to(torch.bfloat16).float()
+            ok &= _check("index_q", got_index_q, index_q, report)
+            ok &= _check("index_w", got["index_w"], index_w, report)
             rows = slice(cur_pos, cur_pos + S)
-            ok &= _check("kv", kv[rows], kv_ref[rows], report)
-            if rank == 0 or not ok:
-                lines = [f"[rank {rank} iter {it} {layer_name}] ok={ok} sel_ok={torch.equal(got['sel'], moe['sel'])}"]
-                lines += [f"   {n:9s} max_err={e:.3e} ref_max={m:.3e} {nb}" for n, e, m, nb in report]
-                print("\n".join(lines), flush=True)
-            if layer_name == "w_layer_0":
-                first_output = out.clone()
-            else:
-                equal = torch.equal(out, first_output)
-                ok &= equal
-                if rank == 0 or not equal:
-                    print(f"[rank {rank} iter {it} {layer_name}] bitwise_equal_to_w_layer_0={equal}", flush=True)
+            ok &= _check("index_k", index_cache[rows], index_ref[rows], report)
+            selected_ok = all(torch.equal(got["indices"][s].sort().values, selected[s].sort().values) for s in range(S))
+            ok &= selected_ok
+            report.append(("index_sel", 0.0, 0.0, f"set_equal={selected_ok}"))
+            # Preserve the kernel's ascending-token output order so split-attention
+            # rounding is compared independently of the selector's order.
+            ref_indices = got["indices"]
+        ref = golden_layer(W, h, cur_pos, kv_ref, pe_ref, ref_indices, cos, sin, allreduce, topk=topk)
+        # attention half vs the full golden
+        for name in ("q_a", "kv_a", "q_nope", "q_pe", "q_lat", "o", "a"):
+            ok &= _check(name, got[name], ref[name], report)
+        # MoE half vs the golden fed the kernel's own post-attention state, so a
+        # 1-ulp difference in ``a`` cannot flip FP8 roundings downstream
+        moe = golden_moe(W, got["a"].clone(), allreduce)
+        for name in ("scores", "prob", "xq"):
+            ok &= _check(name, got[name], moe[name], report)
+        # up/gate + SiLU from the kernel's own FP8 activation
+        ug = golden_moe(W, got["a"].clone(), allreduce, xq=got["xq"].clone())
+        ok &= _check("mid", got["mid"], ug["mid"], report)
+        # down + route weighting + TP reduce + residual from the kernel's own mid
+        down = golden_moe(W, got["a"].clone(), allreduce, got["mid"].clone(), got["sel"].clone(), got["prob"].clone())
+        ok &= _check("x_out", got["x_out"], down["x_out"], report)
+        ok &= torch.equal(got["sel"], moe["sel"])
+        # fully independent golden: only comparable when a 1-ulp difference in ``a``
+        # did not flip a near-tied routing decision
+        if torch.equal(ref["sel"], moe["sel"]):
+            ok &= _check("x_out_e2e", got["x_out"], ref["x_out"], report)
+        else:
+            report.append(("x_out_e2e", 0.0, 0.0, "skipped: golden routing flipped on a 1-ulp difference in a"))
+        rows = slice(cur_pos, cur_pos + S)
+        ok &= _check("kv", kv[rows], kv_ref[rows], report)
+        if rank == 0 or not ok:
+            lines = [f"[rank {rank} iter {it}] ok={ok} sel_ok={torch.equal(got['sel'], moe['sel'])}"]
+            lines += [f"   {n:9s} max_err={e:.3e} ref_max={m:.3e} {nb}" for n, e, m, nb in report]
+            print("\n".join(lines), flush=True)
     op.close()
     return ok
 
 
-def bench_rank(
-    rank,
-    npes,
-    S,
-    cur_pos,
-    iters=320,
-    group=None,
-    seed=1234,
-    with_indexer=False,
-    expert_mxfp4=False,
-    weight_copies=1,
-):
+def bench_rank(rank, npes, S, cur_pos, iters=320, group=None, seed=1234, with_indexer=False, expert_mxfp4=False):
     """HIP-graph replay of ``GLM5_LAUNCHES_PER_STEP`` layers; returns us per layer."""
     from kernels.monokernel.glm import Glm5MonoKernel
 
@@ -292,20 +195,11 @@ def bench_rank(
     torch.cuda.set_device(dev)
     W = make_weights(rank, heads=8, device=dev, seed=seed, with_indexer=with_indexer, expert_mxfp4=expert_mxfp4)
     cos, sin = rope_table(MAX_SEQ, device=dev)
-    gen = torch.Generator(device=dev).manual_seed(seed + 99)
-    kv = torch.randn(MAX_SEQ, KV_LORA, generator=gen, device=dev).to(torch.bfloat16)
-    pe = torch.randn(MAX_SEQ, PE_DIM, generator=gen, device=dev).to(torch.bfloat16)
-    indices = torch.stack(
-        [torch.randperm(max(cur_pos + s + 1, 2048), generator=gen, device=dev)[:2048] for s in range(S)]
-    ).int()
-    index_cache = (
-        torch.randn(MAX_SEQ, INDEX_DIM, generator=gen, device=dev).to(torch.bfloat16) if with_indexer else None
-    )
+    kv = torch.randn(MAX_SEQ, KV_LORA, device=dev).to(torch.bfloat16)
+    pe = torch.randn(MAX_SEQ, PE_DIM, device=dev).to(torch.bfloat16)
+    indices = torch.stack([torch.randperm(max(cur_pos + s + 1, 2048), device=dev)[:2048] for s in range(S)]).int()
+    index_cache = torch.randn(MAX_SEQ, INDEX_DIM, device=dev).to(torch.bfloat16) if with_indexer else None
     launches_per_step = int(os.environ.get("GLM5_LAUNCHES_PER_STEP", "16"))
-    if weight_copies not in (1, 8) or not 1 <= launches_per_step <= 128:
-        raise ValueError("weight_copies must be 1 or 8 and GLM5_LAUNCHES_PER_STEP must be in [1, 128]")
-    if launches_per_step % weight_copies or iters < launches_per_step:
-        raise ValueError("benchmark needs complete weight rotations and at least one full graph replay")
     op = Glm5MonoKernel(
         W,
         S,
@@ -316,14 +210,11 @@ def bench_rank(
         with_indexer=with_indexer,
         index_max_seq=MAX_SEQ,
     )
-    layer_ops = _weight_layers(op, weight_copies)
-    weight_layer_names = tuple(layer_ops)
-    h = torch.randn(S, 6144, generator=gen, device=dev).to(torch.bfloat16)
+    h = torch.randn(S, 6144, device=dev).to(torch.bfloat16)
     x = torch.empty_like(h)
     pos_t = torch.tensor([cur_pos], dtype=torch.int32, device=dev)
-    for warmup in range(max(10, weight_copies)):
-        layer_name = weight_layer_names[warmup % weight_copies]
-        layer_ops[layer_name].forward(h, pos_t, kv, pe, indices, cos, sin, x_out=x, index_cache=index_cache)
+    for _ in range(10):
+        op.forward(h, pos_t, kv, pe, indices, cos, sin, x_out=x, index_cache=index_cache)
     torch.cuda.synchronize()
     import torch.distributed as dist
 
@@ -350,8 +241,7 @@ def bench_rank(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for layer in range(launches_per_step):
-            layer_name = weight_layer_names[layer % weight_copies]
-            layer_ops[layer_name].forward(
+            op.forward(
                 h,
                 pos_t,
                 kv,
@@ -365,13 +255,6 @@ def bench_rank(
                 index_cache=index_cache,
             )
         op.advance_step()
-    timed_replays = iters // launches_per_step
-    if rank == 0:
-        print(
-            f"weight_layers={','.join(weight_layer_names)} graph_layers={launches_per_step} "
-            f"timed_replays={timed_replays} timed_layer_launches={timed_replays * launches_per_step}",
-            flush=True,
-        )
     # Short decode graphs otherwise spend a material fraction of the timed
     # window ramping clocks from the idle state.  Scale warmup with the run so
     # isolated and already-busy-machine measurements remain comparable.
@@ -382,72 +265,40 @@ def bench_rank(
         dist.barrier()
     t0, t1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     t0.record()
-    for _ in range(timed_replays):
+    for _ in range(iters // launches_per_step):
         graph.replay()
     t1.record()
     torch.cuda.synchronize()
-    elapsed = t0.elapsed_time(t1) * 1e3 / (timed_replays * launches_per_step)
+    elapsed = t0.elapsed_time(t1) * 1e3 / (iters // launches_per_step * launches_per_step)
     op.close()
     return elapsed
 
 
-def _worker(rank, npes, S, cur_pos, iters, with_indexer, expert_mxfp4, weight_copies, results):
+def _worker(rank, npes, S, cur_pos, iters, with_indexer, expert_mxfp4, results):
     import torch.distributed as dist
 
     master_port = os.environ.get("GLM5_MASTER_PORT", "29541")
     dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{master_port}", rank=rank, world_size=npes)
     if iters < 0:
-        us = bench_rank(
-            rank,
-            npes,
-            S,
-            cur_pos,
-            iters=-iters,
-            with_indexer=with_indexer,
-            expert_mxfp4=expert_mxfp4,
-            weight_copies=weight_copies,
-        )
+        us = bench_rank(rank, npes, S, cur_pos, iters=-iters, with_indexer=with_indexer, expert_mxfp4=expert_mxfp4)
         results[rank] = us
         print(f"[rank {rank}] {us:.1f} us/layer", flush=True)
     else:
         results[rank] = run_rank(
-            rank,
-            npes,
-            S,
-            cur_pos,
-            iters,
-            group=None,
-            with_indexer=with_indexer,
-            expert_mxfp4=expert_mxfp4,
-            weight_copies=weight_copies,
+            rank, npes, S, cur_pos, iters, group=None, with_indexer=with_indexer, expert_mxfp4=expert_mxfp4
         )
     dist.barrier()
     dist.destroy_process_group()
 
 
-def run(npes, S, cur_pos, iters, with_indexer=False, expert_mxfp4=False, weight_copies=1):
+def run(npes, S, cur_pos, iters, with_indexer=False, expert_mxfp4=False):
     if npes == 1:
-        return run_rank(
-            0,
-            1,
-            S,
-            cur_pos,
-            iters,
-            with_indexer=with_indexer,
-            expert_mxfp4=expert_mxfp4,
-            weight_copies=weight_copies,
-        )
+        return run_rank(0, 1, S, cur_pos, iters, with_indexer=with_indexer, expert_mxfp4=expert_mxfp4)
     import torch.multiprocessing as mp
 
     mgr = mp.Manager()
     results = mgr.dict()
-    mp.spawn(
-        _worker,
-        args=(npes, S, cur_pos, iters, with_indexer, expert_mxfp4, weight_copies, results),
-        nprocs=npes,
-    )
-    if iters < 0:
-        print(f"max-rank {max(results.values()):.3f} us/layer", flush=True)
+    mp.spawn(_worker, args=(npes, S, cur_pos, iters, with_indexer, expert_mxfp4, results), nprocs=npes)
     return all(results[r] for r in range(npes))
 
 
@@ -460,56 +311,6 @@ def test_layer_single_gpu(S, cur_pos):
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="needs 8 GPUs")
 def test_layer_tp8():
     assert run(8, 1, 3000, 3)
-
-
-@pytest.mark.parametrize("S", (1, 2, 4, 8))
-def test_layer_mxfp4(S):
-    assert run(1, S, 3000, 1, expert_mxfp4=True)
-
-
-@pytest.mark.parametrize("expert_mxfp4,with_indexer", [(False, False), (True, False), (True, True)])
-def test_layer_weight_rotation(expert_mxfp4, with_indexer):
-    assert run(1, 4, 3000, 1, expert_mxfp4=expert_mxfp4, with_indexer=with_indexer, weight_copies=8)
-
-
-@pytest.mark.multi_gpu
-@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="needs 8 GPUs")
-def test_layer_mxfp4_tp8_weight_rotation():
-    assert run(8, 4, 3000, 1, expert_mxfp4=True, weight_copies=8)
-
-
-def test_mxfp4_scale_tiles():
-    """Nonuniform scales must follow their 16-row tiles and K blocks exactly."""
-    from kernels.monokernel.packing import pack_mxfp4_scale_tiles
-
-    scales = torch.arange(2 * 32 * 8).remainder(11).add(117).to(torch.uint8).reshape(2, 32, 8)
-    packed = pack_mxfp4_scale_tiles(scales).reshape(2, 2, 2, 16, 4)
-    for e in range(2):
-        for rg in range(2):
-            for kc in range(2):
-                for row in range(16):
-                    assert torch.equal(packed[e, rg, kc, row], scales[e, rg * 16 + row, kc * 4 : kc * 4 + 4])
-
-
-@pytest.mark.parametrize("S", (1, 4))
-def test_layer_mxfp4_nonuniform_scales(S, monkeypatch):
-    """Exercise scale addressing across rows, K blocks, experts, and paired gate/up."""
-    original = make_weights
-
-    def varied_weights(*args, **kwargs):
-        weights = original(*args, **kwargs)
-        gen = torch.Generator(device=weights.t["s_ug"].device).manual_seed(2026)
-        for name, exponent in (("s_ug", 118), ("s_dn", 121)):
-            scale = weights.t[name]
-            scale.copy_(
-                torch.randint(
-                    exponent - 1, exponent + 2, scale.shape, generator=gen, device=scale.device, dtype=torch.uint8
-                )
-            )
-        return weights
-
-    monkeypatch.setitem(run_rank.__globals__, "make_weights", varied_weights)
-    assert run(1, S, 3000, 1, expert_mxfp4=True, weight_copies=8)
 
 
 @pytest.mark.parametrize(
@@ -582,23 +383,13 @@ if __name__ == "__main__":
     ap.add_argument("--bench-iters", type=int, default=320, help="layer launches timed by --bench")
     ap.add_argument("--indexer", action="store_true", help="fuse indexer projection, scoring, and top-k")
     ap.add_argument("--mxfp4", action="store_true", help="use native MXFP4 expert weights")
-    ap.add_argument(
-        "--weight-copies",
-        type=int,
-        choices=(1, 8),
-        default=1,
-        help="rotate identical packed weights at distinct addresses; check every copy with the same golden",
-    )
     a = ap.parse_args()
-    if a.iters < 1 or a.bench_iters < 1:
-        ap.error("iteration counts must be positive")
-    kwargs = dict(with_indexer=a.indexer, expert_mxfp4=a.mxfp4, weight_copies=a.weight_copies)
     if a.bench:
         if a.npes == 1:
-            print(f"{bench_rank(0, 1, a.S, a.pos, iters=a.bench_iters, **kwargs):.1f} us/layer")
+            print(
+                f"{bench_rank(0, 1, a.S, a.pos, iters=a.bench_iters, with_indexer=a.indexer, expert_mxfp4=a.mxfp4):.1f} us/layer"
+            )
         else:
-            run(a.npes, a.S, a.pos, -a.bench_iters, **kwargs)
+            run(a.npes, a.S, a.pos, -a.bench_iters, with_indexer=a.indexer, expert_mxfp4=a.mxfp4)
         sys.exit(0)
-    ok = run(a.npes, a.S, a.pos, a.iters, **kwargs)
-    print("PASS" if ok else "FAIL")
-    sys.exit(0 if ok else 1)
+    print("PASS" if run(a.npes, a.S, a.pos, a.iters, with_indexer=a.indexer, expert_mxfp4=a.mxfp4) else "FAIL")
